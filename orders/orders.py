@@ -1,9 +1,13 @@
+import json
 from flask import jsonify, request
 from classes.order.connection import connection
 from classes.order.basic_auth import auth, app
 from classes.utils.manipulation import Convert, Validation
+from classes.utils.consumer import Consumer
 import classes.utils.vars as v
 import requests 
+import uuid
+from kafka import  KafkaProducer
 
 urlc=f"http://{v.app_endpoint}:8080/clients"
 urlp=f"http://{v.app_endpoint}:8082/products"
@@ -142,40 +146,41 @@ def postOrder():
             if request.json:
                 #Verifica os campos do json
                 try:
-                    json = request.json
-                    _id = json['id']
-                    _observation = json['observation']
-                    _clientid = json['clientid']
-                    _productid = json['productid']
+                    _json = request.json
+                    _observation = _json['observation']
+                    _clientid = _json['clientid']
+                    _productid = _json['productid']
+                    _json['transaction_id'] = str(uuid.uuid4())
+
                     #Tratamento da data
-                    if not Validation.ValDate(json['orderdate']):
+                    if not Validation.ValDate(_json['orderdate']):
                         return jsonify({"Error" :"Verique se a data informada em 'orderdate' esta formatada de maneira correta"}), 400
-                    _orderdate = Validation.ValDate(json['orderdate'])
+                    _orderdate = Validation.ValDate(_json['orderdate'])
 
-                    #Validação de id pela api clients
-                    try:
-                        req = requests.get(url=urlc, headers={'Authorization':'Basic YWRtaW46YWRtaW4xMjM='}, params={"id":_clientid})
-                    except Exception as e:
-                        return jsonify({"Error":"Comunicação com a API de clientes falhou"}), 500
-                    if not req.status_code == 200:
-                        return jsonify({"Error" :"O id passado nao corresponde a nenhum cliente"}), 400
+                   #Envio para a fila de NEW_ORDER
+                    producer = KafkaProducer(bootstrap_servers=[f"{v.kafka_endpoint}:19092", f"{v.kafka_endpoint}:29092", f"{v.kafka_endpoint}:39092"], 
+                        value_serializer=lambda v: json.dumps(v).encode("utf-8")
+                        )
+                    producer.send("NEW_ORDER", _json).get()
 
-                    #Validação de id pela api Products
-                    try:
-                        req = requests.get(url=urlp, headers={'Authorization':'Basic YWRtaW46YWRtaW4xMjM='}, params={"id":_productid})
-                    except Exception as e:
-                        return jsonify({"Error":"Comunicação com a API de products falhou"}), 500
-                    if not req.status_code == 200:
-                        return jsonify({"Error" :"O id passado nao corresponde a nenhum produto"}), 400
-                    #Verificação de disponibilidade do produto
-                    if req.json()[0]['availability'] == 'No':
-                        return jsonify({"Error":"O produto nao esta disponivel para venda no momento"}),400
+                    #Validação
+                    result = Consumer.validateOrder(_json['transaction_id'])
+                    
                 except Exception as e:
                     return jsonify({"Error" :"Json enviado de maneira incorreta, verifique o campo {}".format(e)}), 400
 
+                if(not result):
+                    return jsonify({"Status" :f"Status não pode ser obtido, contate o administrador do sistema, id da transação: {_json['transaction_id']} "}), 500  
+                if("1e" in result):
+                    return jsonify({"Status" :"Registro não concluído, cliente inválido"}), 400
+                elif("2e" in result):
+                    return jsonify({"Status" :"Registro não concluído, produto inválido"}), 400  
+                elif("3e" in result):
+                    return jsonify({"Status" :"Registro não concluído, cliente e produto inválidos"}), 400  
+
                 #Executa a query sql
-                sqlQuery = "INSERT INTO orders (id, clientid, productid, orderdate, observation) VALUES (%s,%s,%s,%s,%s)"
-                cur.execute(sqlQuery,(_id,_clientid, _productid, _orderdate, _observation))
+                sqlQuery = "INSERT INTO orders (clientid, productid, orderdate, observation) VALUES (%s,%s,%s,%s)"
+                cur.execute(sqlQuery,(_clientid, _productid, _orderdate, _observation))
                 connection.commit()
                 return jsonify({"Status" :"Registro criado com sucesso"}), 201
             else:
